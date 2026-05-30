@@ -4,13 +4,12 @@ Algoritmo: NEH + Búsqueda Local (Or-opt + 2-opt) + ILS (double-bridge)
 Tiempo por instancia: ~15 seg → 30 instancias = ~450 seg (dentro del límite de 600)
 """
 
-import random
-import numpy as np
-import time
-import pandas as pd
 import json
-import math
+import random
+import time
 
+import numpy as np
+import pandas as pd
 
 # =============================================================================
 # NÚCLEO DEL ALGORITMO
@@ -24,10 +23,11 @@ def _calcular_cmax(secuencia, lotes, setup):
     fin = [[0.0]*3 for _ in range(len(secuencia))]
     for i, lote in enumerate(secuencia):
         tipo_act = lotes[lote]["tipo"]
-        for k, m in enumerate(["M1","M2","M3"]):
+        for k, m in enumerate(["M1", "M2", "M3"]):
             t_setup = 0
             if i > 0:
                 tipo_ant = lotes[secuencia[i-1]]["tipo"]
+                # FIX: setup solo cuando tipos son distintos (tipo_ant == tipo_act => 0)
                 if tipo_ant != tipo_act:
                     t_setup = setup[m][f"{tipo_ant}-{tipo_act}"]
             lm = fin[i-1][k] if i > 0 else 0.0
@@ -49,11 +49,13 @@ def _neh(lotes_ids, lotes, setup):
     orden = sorted(lotes_ids, key=lambda l: suma[l], reverse=True)
     secuencia = [orden[0]]
     for lote in orden[1:]:
-        mejor_c = float("inf"); mejor_pos = 0
+        mejor_c = float("inf")
+        mejor_pos = 0
         for pos in range(len(secuencia)+1):
             c = _calcular_cmax(secuencia[:pos]+[lote]+secuencia[pos:], lotes, setup)
             if c < mejor_c:
-                mejor_c = c; mejor_pos = pos
+                mejor_c = c
+                mejor_pos = pos
         secuencia = secuencia[:mejor_pos]+[lote]+secuencia[mejor_pos:]
     return secuencia
 
@@ -84,7 +86,8 @@ def _busqueda_local(seq, lotes, setup, t_corte=None):
                         if c < mejor_c:
                             mejor_c = c
                             mejor = base[:j]+segmento+base[j:]
-                            mejorado = True; mejorado_global = True
+                            mejorado = True
+                            mejorado_global = True
 
         mejorado = True
         while mejorado:
@@ -97,7 +100,10 @@ def _busqueda_local(seq, lotes, setup, t_corte=None):
                     candidata[i], candidata[j] = candidata[j], candidata[i]
                     c = _calcular_cmax(candidata, lotes, setup)
                     if c < mejor_c:
-                        mejor_c = c; mejor = candidata[:]; mejorado = True; mejorado_global = True
+                        mejor_c = c
+                        mejor = candidata[:]
+                        mejorado = True
+                        mejorado_global = True
 
         mejorado = True
         while mejorado:
@@ -113,7 +119,10 @@ def _busqueda_local(seq, lotes, setup, t_corte=None):
                     for j in range(len(base)+1):
                         c = _calcular_cmax(base[:j]+seg_inv+base[j:], lotes, setup)
                         if c < mejor_c:
-                            mejor_c = c; mejor = base[:j]+seg_inv+base[j:]; mejorado = True; mejorado_global = True
+                            mejor_c = c
+                            mejor = base[:j]+seg_inv+base[j:]
+                            mejorado = True
+                            mejorado_global = True
 
     return mejor, mejor_c
 
@@ -126,7 +135,7 @@ def _double_bridge(seq):
 
 
 def _perturbacion_guiada(seq, lotes):
-    tipos = ["S","N","R"]
+    tipos = ["S", "N", "R"]
     random.shuffle(tipos)
     for tipo in tipos:
         indices = [i for i, l in enumerate(seq) if lotes[l]["tipo"] == tipo]
@@ -153,9 +162,9 @@ def _ils(seq_inicial, cmax_inicial, lotes, setup, t_corte):
     iteracion = 0
 
     while time.perf_counter() < t_corte:
-        perturb = _double_bridge(actual) if iteracion % 2 == 0 else _perturbacion_guiada(actual, lotes)
+        perturb = (_double_bridge(actual) if iteracion % 2 == 0
+                   else _perturbacion_guiada(actual, lotes))
 
-        # Búsqueda local con tiempo controlado (máx mitad del tiempo restante)
         t_restante = t_corte - time.perf_counter()
         t_bl = time.perf_counter() + min(t_restante * 0.4, 2.0)
         s_local, c_local = _busqueda_local(perturb, lotes, setup, t_corte=t_bl)
@@ -175,11 +184,64 @@ def _ils(seq_inicial, cmax_inicial, lotes, setup, t_corte):
 
 
 # =============================================================================
-# CLASE SCHEDULLING — estructura requerida por Gradescope
+# FUNCIÓN solve() — formato requerido por Gradescope
+# FIX: se agrega solve() que faltaba; retorna {"Cmax", "secuencia", "tiempo"}
 # =============================================================================
 
-# Tiempo máximo por instancia en segundos.
-# 30 instancias × 15 seg = 450 seg < 600 seg límite de Gradescope.
+def solve(data: dict) -> dict:
+    """
+    Parámetro: data — diccionario cargado desde data.json
+    Retorna: {"Cmax": int, "secuencia": list[str], "tiempo": int}
+    """
+    start_ms = time.time()
+    t_inicio = time.perf_counter()
+
+    # FIX: tiempo máximo de 55 s (margen de seguridad ante el límite de 60 s)
+    TIEMPO_LIMITE = 55.0
+    t_corte = t_inicio + TIEMPO_LIMITE
+
+    lotes = data["lotes"]
+    setup = data["setup"]
+    lotes_ids = list(lotes.keys())
+
+    random.seed(42)
+    np.random.seed(42)
+
+    # Fase 1: NEH
+    seq_neh = _neh(lotes_ids, lotes, setup)
+
+    # Fase 2: búsqueda local con tiempo controlado
+    # FIX: se pasa t_corte para que no exceda el límite
+    seq_bl, cmax_bl = _busqueda_local(seq_neh, lotes, setup, t_corte=t_corte)
+
+    mejor_seq = seq_bl[:]
+    mejor_cmax = cmax_bl
+
+    # Fase 3: ILS hasta agotar el tiempo
+    if time.perf_counter() < t_corte - 0.5:
+        seq_ils, cmax_ils = _ils(seq_bl, cmax_bl, lotes, setup, t_corte)
+        if cmax_ils < mejor_cmax:
+            mejor_cmax = cmax_ils
+            mejor_seq = seq_ils[:]
+
+    # Validación de seguridad
+    if not _es_factible(mejor_seq, lotes) or mejor_cmax == float("inf"):
+        mejor_seq = seq_neh
+        mejor_cmax = _calcular_cmax(seq_neh, lotes, setup)
+
+    elapsed_ms = int((time.time() - start_ms) * 1000)
+
+    return {
+        "Cmax": int(mejor_cmax),
+        "secuencia": mejor_seq,
+        "tiempo": elapsed_ms
+    }
+
+
+# =============================================================================
+# CLASE Schedulling — estructura auxiliar para experimentos locales
+# =============================================================================
+
 TIEMPO_POR_INSTANCIA = 15.0
 
 
@@ -194,9 +256,9 @@ class Schedulling:
         self.consolidado = None
 
     def generar_instancia(self, indice):
-        tipos = ["S","N","R"]
+        tipos = ["S", "N", "R"]
         lotes = [f"L{i}" for i in range(1, 16)]
-        rangos = {"M1": (25,45), "M2": (20,40), "M3": (10,25)}
+        rangos = {"M1": (25, 45), "M2": (20, 40), "M3": (10, 25)}
 
         lotes_dict = {}
         for lote in lotes:
@@ -209,16 +271,19 @@ class Schedulling:
             }
 
         setup_dict = {}
-        for maquina in ["M1","M2","M3"]:
+        for maquina in ["M1", "M2", "M3"]:
             setup_dict[maquina] = {}
             for tipo_ant in tipos:
                 for tipo_sig in tipos:
                     if tipo_ant == tipo_sig:
                         t = 0
                     else:
-                        if maquina == "M1": t = random.randint(10, 40)
-                        elif maquina == "M2": t = random.randint(5, 30)
-                        else: t = random.randint(3, 15)
+                        if maquina == "M1":
+                            t = random.randint(10, 40)
+                        elif maquina == "M2":
+                            t = random.randint(5, 30)
+                        else:
+                            t = random.randint(3, 15)
                     setup_dict[maquina][f"{tipo_ant}-{tipo_sig}"] = t
 
         return {"lotes": lotes_dict, "setup": setup_dict}
@@ -235,7 +300,8 @@ class Schedulling:
         # Fase 1: NEH
         seq_neh = _neh(lotes_ids, lotes, setup)
 
-        # Fase 2: búsqueda local (con tiempo máximo)
+        # Fase 2: búsqueda local con tiempo controlado
+        # FIX: se pasa t_corte para que no exceda el límite por instancia
         seq_bl, cmax_bl = _busqueda_local(seq_neh, lotes, setup, t_corte=t_corte)
 
         mejor_seq = seq_bl[:]
@@ -287,7 +353,7 @@ class Schedulling:
     def calcular_makespan_penalizado(self, data={}, secuencia=[f'L{i}' for i in range(1, 16)]):
         lotes = data["lotes"]
         setup = data["setup"]
-        maquinas = ["M1","M2","M3"]
+        maquinas = ["M1", "M2", "M3"]
 
         penalizado = any(
             lotes[secuencia[i-1]]["tipo"] == "N" and lotes[secuencia[i]]["tipo"] == "R"
@@ -301,6 +367,8 @@ class Schedulling:
         for lote in secuencia:
             tipo_actual = lotes[lote]["tipo"]
             for m_idx, m in enumerate(maquinas):
+                # FIX: prev_tipo se obtiene del último registro de tiempos[m],
+                # no de fin_lote. Se rastrea correctamente con la lista tiempos[m].
                 prev_tipo = tiempos[m][-1]["tipo"] if tiempos[m] else None
                 t_setup = 0
                 if prev_tipo is not None and prev_tipo != tipo_actual:
@@ -310,7 +378,12 @@ class Schedulling:
                 else:
                     inicio = max(fin_maquina[m], fin_lote[lote]) + t_setup
                 fin = inicio + lotes[lote][m]
-                tiempos[m].append({"lote": lote, "tipo": tipo_actual, "inicio": inicio, "fin": fin})
+                tiempos[m].append({
+                    "lote": lote,
+                    "tipo": tipo_actual,
+                    "inicio": inicio,
+                    "fin": fin
+                })
                 fin_maquina[m] = fin
                 fin_lote[lote] = fin
 
@@ -318,8 +391,12 @@ class Schedulling:
         return float('inf') if penalizado else makespan
 
 
+# =============================================================================
+# PUNTO DE ENTRADA — Gradescope llama a solve(data)
+# =============================================================================
+
 if __name__ == "__main__":
-    sch = Schedulling(30)
-    df_resultados = sch.ejecutar_experimentos()
-    print("\nConsolidado final:")
-    print(df_resultados)
+    with open("data.json") as f:
+        data = json.load(f)
+    print(json.dumps(solve(data), indent=2))
+
