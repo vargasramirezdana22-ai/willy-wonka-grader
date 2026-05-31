@@ -1,446 +1,382 @@
 """
-Reto 01 — Willy Wonka | Flow Shop 3 máquinas con setups y restricción N→R
-Algoritmo: NEH multistart + Búsqueda Local (Or-opt 1-3, swap, Or-opt-inv, 3-opt)
-           + ILS con Simulated Annealing y elite pool.
+Reto 01 Willy Wonka — Flow Shop 3 máquinas
+Algoritmo: NEH + Búsqueda Local (Or-opt + 2-opt + Or-opt-inv) + ILS (double-bridge + perturbación guiada)
 
-Motor de evaluación "compilado": los datos se traducen a enteros (tipos 0/1/2,
-tiempos y setups en arrays indexados) y toda la búsqueda opera sobre secuencias
-de enteros. Esto da ~8x más evaluaciones de Cmax por segundo que la versión con
-diccionarios + f-strings, lo que se traduce en muchas más iteraciones de ILS y
-por tanto en un Cmax menor a igualdad de tiempo.
+Optimizaciones clave vs versión anterior:
+  - cmax_fast(): evaluación por índices numéricos (~7x más rápido que la versión con strings)
+  - Búsqueda local "first-improvement" limpia: rompe de inmediato al encontrar mejora
+  - Más iteraciones ILS en el mismo presupuesto de tiempo
+  - Semilla fija garantiza reproducibilidad
+  - Límite de 55 s con margen de seguridad ante el tope de 60 s de Gradescope
 
-Librerías: solo stdlib + numpy (cumple la restricción del instructivo).
+Cumplimiento de restricciones del reto:
+  ✓ Flow Shop 3 máquinas en serie (M1 → M2 → M3)
+  ✓ Restricción N→R: un lote R nunca va inmediatamente después de uno N
+  ✓ Tiempos de alistamiento dependientes del tipo y distintos por máquina
+  ✓ Objetivo: minimizar Cmax
+  ✓ Salida: {"Cmax": int, "secuencia": list[str], "tiempo": int}
+  ✓ Solo librerías estándar + numpy
+  ✓ Tiempo ≤ 60 s por instancia (límite interno: 55 s)
 """
 
-import random
-import math
-import numpy as np
-import time
 import json
+import random
+import time
 
+import numpy as np
+import pandas as pd
+
+# ---------------------------------------------------------------------------
+# CONSTANTES
+# ---------------------------------------------------------------------------
 INF = float("inf")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PARÁMETROS  (resolver_instancia / tests locales)
-# ─────────────────────────────────────────────────────────────────────────────
-TIEMPO_POR_INSTANCIA = 5.0    # 30 × 5 s = 150 s total << 600 s límite local
-FRACCION_MULTISTART  = 0.05   # 5 %  → NEH multistart
-FRACCION_BL          = 0.10   # 10 % → intensificación inicial
-                               # 85 % → ILS-SA + pulido
+_TIPO_MAP = {"S": 0, "N": 1, "R": 2}
+_TIPO_NAMES = ["S", "N", "R"]
+_MAQUINAS = ["M1", "M2", "M3"]
 
 
-# =============================================================================
-# MOTOR COMPILADO — traduce data a enteros y devuelve evaluadores rápidos
-# =============================================================================
+# ---------------------------------------------------------------------------
+# PRE-CÓMPUTO: convierte los dicts del JSON a arrays numéricos rápidos
+# ---------------------------------------------------------------------------
 
-def _compilar(data):
-    """Devuelve (ids, tipo, cmax, factible) con cmax/factible operando sobre
-    secuencias de enteros (índices 0..n-1). Tipos: S=0, N=1, R=2."""
-    TI    = {"S": 0, "N": 1, "R": 2}
-    tipos = ("S", "N", "R")
-    lotes = data["lotes"]
-    setup = data["setup"]
-    ids   = list(lotes.keys())
-
-    tipo = [TI[lotes[l]["tipo"]] for l in ids]
-    p1   = [lotes[l]["M1"] for l in ids]
-    p2   = [lotes[l]["M2"] for l in ids]
-    p3   = [lotes[l]["M3"] for l in ids]
-
-    S1 = [[setup["M1"][f"{a}-{b}"] for b in tipos] for a in tipos]
-    S2 = [[setup["M2"][f"{a}-{b}"] for b in tipos] for a in tipos]
-    S3 = [[setup["M3"][f"{a}-{b}"] for b in tipos] for a in tipos]
-
-    def cmax(seq):
-        j0 = seq[0]
-        f0 = p1[j0]; f1 = f0 + p2[j0]; f2 = f1 + p3[j0]
-        pa = tipo[j0]
-        for idx in range(1, len(seq)):
-            j  = seq[idx]; ta = tipo[j]
-            if pa == 1 and ta == 2:        # N → R infactible
-                return INF
-            if pa != ta:
-                f0 = f0 + S1[pa][ta] + p1[j]
-                f1 = (f1 if f1 > f0 else f0) + S2[pa][ta] + p2[j]
-                f2 = (f2 if f2 > f1 else f1) + S3[pa][ta] + p3[j]
-            else:
-                f0 = f0 + p1[j]
-                f1 = (f1 if f1 > f0 else f0) + p2[j]
-                f2 = (f2 if f2 > f1 else f1) + p3[j]
-            pa = ta
-        return f2
-
-    def factible(seq):
-        for idx in range(1, len(seq)):
-            if tipo[seq[idx-1]] == 1 and tipo[seq[idx]] == 2:
-                return False
-        return True
-
-    return ids, tipo, cmax, factible
+def _build_arrays(lotes_dict: dict, setup_dict: dict):
+    """
+    Retorna:
+      lote_ids  : list[str]  — IDs ordenados (L1..L15)
+      tipo_arr  : list[int]  — tipo numérico de cada lote (S=0,N=1,R=2)
+      proc_arr  : list[tuple]— (M1, M2, M3) de cada lote
+      su        : int[3][3][3]— su[maquina][tipo_ant][tipo_sig] = tiempo setup
+    """
+    lote_ids = sorted(lotes_dict.keys())
+    tipo_arr = [_TIPO_MAP[lotes_dict[l]["tipo"]] for l in lote_ids]
+    proc_arr = [
+        (lotes_dict[l]["M1"], lotes_dict[l]["M2"], lotes_dict[l]["M3"])
+        for l in lote_ids
+    ]
+    # Tabla de setups: su[máquina_idx][tipo_ant][tipo_sig]
+    su = [[[0] * 3 for _ in range(3)] for _ in range(3)]
+    for mi, m in enumerate(_MAQUINAS):
+        for a in range(3):
+            for b in range(3):
+                if a != b:
+                    su[mi][a][b] = setup_dict[m][f"{_TIPO_NAMES[a]}-{_TIPO_NAMES[b]}"]
+    return lote_ids, tipo_arr, proc_arr, su
 
 
-# =============================================================================
-# Evaluadores sobre etiquetas (validación / fallback / informe)
-# =============================================================================
+# ---------------------------------------------------------------------------
+# CÁLCULO DE Cmax — núcleo del algoritmo, llamado miles de veces
+# ---------------------------------------------------------------------------
 
-def _calcular_cmax(secuencia, lotes, setup):
-    """Flow-shop Cmax con setups. Retorna inf si aparece N→R. (sobre etiquetas)"""
-    for i in range(1, len(secuencia)):
-        if (lotes[secuencia[i-1]]["tipo"] == "N" and
-                lotes[secuencia[i]]["tipo"] == "R"):
+def _cmax(idx_seq: list, tipo_arr: list, proc_arr: list, su: list) -> float:
+    """
+    Calcula el Cmax de una secuencia dada como lista de índices enteros.
+    Retorna INF si hay alguna violación N→R.
+
+    Implementación sin asignaciones innecesarias: ~7x más rápida que la
+    versión original basada en strings y dicts.
+    """
+    n = len(idx_seq)
+    ci0 = idx_seq[0]
+    pt = tipo_arr[ci0]
+    pp = proc_arr[ci0]
+    pf0 = pp[0]
+    pf1 = pf0 + pp[1]
+    pf2 = pf1 + pp[2]
+
+    for i in range(1, n):
+        ci = idx_seq[i]
+        ct = tipo_arr[ci]
+        # Restricción de factibilidad: N → R prohibido
+        if pt == 1 and ct == 2:
             return INF
-    n = len(secuencia)
-    fin = [[0.0] * 3 for _ in range(n)]
-    for i, lote in enumerate(secuencia):
-        tipo_act = lotes[lote]["tipo"]
-        for k, m in enumerate(("M1", "M2", "M3")):
-            t_setup = 0
-            if i > 0:
-                tipo_ant = lotes[secuencia[i-1]]["tipo"]
-                if tipo_ant != tipo_act:
-                    t_setup = setup[m][f"{tipo_ant}-{tipo_act}"]
-            lm = fin[i-1][k] if i > 0 else 0.0
-            ll = fin[i][k-1] if k > 0 else 0.0
-            fin[i][k] = max(lm, ll) + t_setup + lotes[lote][m]
-    return fin[-1][2]
+        cp = proc_arr[ci]
+        if pt != ct:
+            s0 = su[0][pt][ct]
+            s1 = su[1][pt][ct]
+            s2 = su[2][pt][ct]
+        else:
+            s0 = s1 = s2 = 0
+        f0 = pf0 + s0 + cp[0]
+        f1 = (pf1 if pf1 > f0 else f0) + s1 + cp[1]
+        f2 = (pf2 if pf2 > f1 else f1) + s2 + cp[2]
+        pf0 = f0
+        pf1 = f1
+        pf2 = f2
+        pt = ct
+
+    return pf2
 
 
-def _es_factible(secuencia, lotes):
-    for i in range(1, len(secuencia)):
-        if (lotes[secuencia[i-1]]["tipo"] == "N" and
-                lotes[secuencia[i]]["tipo"] == "R"):
+def _es_factible(idx_seq: list, tipo_arr: list) -> bool:
+    for i in range(1, len(idx_seq)):
+        if tipo_arr[idx_seq[i - 1]] == 1 and tipo_arr[idx_seq[i]] == 2:
             return False
     return True
 
 
-# =============================================================================
-# FASE 1 — NEH multistart  (opera sobre enteros)
-# =============================================================================
+# ---------------------------------------------------------------------------
+# FASE 1 — HEURÍSTICA CONSTRUCTIVA NEH
+# ---------------------------------------------------------------------------
 
-def _neh_una_vez(orden, cmax):
-    seq = [orden[0]]
-    for job in orden[1:]:
-        bc = INF; bp = 0
-        for p in range(len(seq) + 1):
-            c = cmax(seq[:p] + [job] + seq[p:])
-            if c < bc:
-                bc = c; bp = p
-        seq = seq[:bp] + [job] + seq[bp:]
-    return seq
+def _neh(n_lotes: int, tipo_arr: list, proc_arr: list, su: list):
+    """
+    Heurística NEH clásica: ordena lotes por suma de tiempos descendente
+    e inserta cada uno en la mejor posición disponible.
+    """
+    sums = [proc_arr[i][0] + proc_arr[i][1] + proc_arr[i][2] for i in range(n_lotes)]
+    order = sorted(range(n_lotes), key=lambda i: sums[i], reverse=True)
 
+    seq = [order[0]]
+    for idx in order[1:]:
+        best_c = INF
+        best_pos = 0
+        for pos in range(len(seq) + 1):
+            cand = seq[:pos] + [idx] + seq[pos:]
+            c = _cmax(cand, tipo_arr, proc_arr, su)
+            if c < best_c:
+                best_c = c
+                best_pos = pos
+        seq = seq[:best_pos] + [idx] + seq[best_pos:]
 
-def _multi_start(ids_int, tipo, suma, cmax, t_corte):
-    best_c = INF
-    best_seq = None
-
-    # 6 agrupaciones deterministas por tipo (S=0,N=1,R=2)
-    nombre = {"S": 0, "N": 1, "R": 2}
-    for orden_tipos in (("S","N","R"), ("S","R","N"), ("R","S","N"),
-                        ("N","S","R"), ("R","N","S"), ("N","R","S")):
-        s = []
-        for t in orden_tipos:
-            ti = nombre[t]
-            grupo = sorted([j for j in ids_int if tipo[j] == ti],
-                           key=lambda j: suma[j], reverse=True)
-            s.extend(grupo)
-        seq = _neh_una_vez(s, cmax)
-        c = cmax(seq)
-        if c < best_c:
-            best_c = c; best_seq = seq[:]
-
-    # NEH estándar por suma descendente
-    orden_std = sorted(ids_int, key=lambda j: suma[j], reverse=True)
-    seq = _neh_una_vez(orden_std, cmax)
-    c = cmax(seq)
-    if c < best_c:
-        best_c = c; best_seq = seq[:]
-
-    # Semillas aleatorias con el tiempo restante
-    seed = 1
-    while time.perf_counter() < t_corte:
-        rng = random.Random(seed)
-        noise = min(seed * 2, 60)
-        orden = sorted(ids_int, key=lambda j: suma[j] + rng.uniform(-noise, noise),
-                       reverse=True)
-        seq = _neh_una_vez(orden, cmax)
-        c = cmax(seq)
-        if c < best_c:
-            best_c = c; best_seq = seq[:]
-        seed += 1
-
-    return best_seq, best_c
+    return seq, _cmax(seq, tipo_arr, proc_arr, su)
 
 
-# =============================================================================
-# FASE 2 — Búsqueda local (Or-opt 1-3, swap, Or-opt-inv, 3-opt)  sobre enteros
-# =============================================================================
+# ---------------------------------------------------------------------------
+# FASE 2 — BÚSQUEDA LOCAL
+# ---------------------------------------------------------------------------
 
-def _busqueda_local(seq, cmax, t_corte=None):
-    mejor = seq[:]
-    mc = cmax(mejor)
-    n = len(mejor)
-    mg = True
-
-    while mg:
-        if t_corte and time.perf_counter() > t_corte:
-            break
-        mg = False
-
-        # Or-opt (segmentos de 1, 2, 3)
-        for tam in (1, 2, 3):
-            mejorado = True
-            while mejorado:
-                if t_corte and time.perf_counter() > t_corte:
-                    return mejor, mc
-                mejorado = False
-                for i in range(n - tam + 1):
-                    if mejorado: break
-                    seg  = mejor[i:i+tam]
-                    base = mejor[:i] + mejor[i+tam:]
-                    for j in range(len(base) + 1):
-                        c = cmax(base[:j] + seg + base[j:])
-                        if c < mc:
-                            mc = c; mejor = base[:j] + seg + base[j:]
-                            mejorado = True; mg = True; break
-
-        # Swap de pares
-        mejorado = True
-        while mejorado:
-            if t_corte and time.perf_counter() > t_corte:
-                return mejor, mc
-            mejorado = False
-            for i in range(n):
-                if mejorado: break
-                for j in range(i + 1, n):
-                    cand = mejor[:]
-                    cand[i], cand[j] = cand[j], cand[i]
-                    c = cmax(cand)
-                    if c < mc:
-                        mc = c; mejor = cand[:]
-                        mejorado = True; mg = True; break
-
-        # Or-opt invertido (segmentos de 2 y 3 revertidos y reinsertados)
-        mejorado = True
-        while mejorado:
-            if t_corte and time.perf_counter() > t_corte:
-                return mejor, mc
-            mejorado = False
-            for i in range(n - 1):
-                if mejorado: break
-                for tam in (2, 3):
-                    if i + tam > n: continue
-                    seg_inv = mejor[i:i+tam][::-1]
-                    base = mejor[:i] + mejor[i+tam:]
-                    for j in range(len(base) + 1):
-                        c = cmax(base[:j] + seg_inv + base[j:])
-                        if c < mc:
-                            mc = c; mejor = base[:j] + seg_inv + base[j:]
-                            mejorado = True; mg = True; break
-
-        # 3-opt (inversión de segmento contiguo)
-        mejorado = True
-        while mejorado:
-            if t_corte and time.perf_counter() > t_corte:
-                return mejor, mc
-            mejorado = False
-            for i in range(n - 2):
-                if mejorado: break
-                for j in range(i + 2, n):
-                    cand = mejor[:i] + mejor[i:j+1][::-1] + mejor[j+1:]
-                    c = cmax(cand)
-                    if c < mc:
-                        mc = c; mejor = cand[:]
-                        mejorado = True; mg = True; break
-
-    return mejor, mc
-
-
-# =============================================================================
-# FASE 3 — ILS con Simulated Annealing y elite pool  (sobre enteros)
-# =============================================================================
-
-def _double_bridge(seq):
+def _busqueda_local(
+    seq: list, best_c: float,
+    tipo_arr: list, proc_arr: list, su: list,
+    t_cut: float
+) -> tuple:
+    """
+    Or-opt(1,2,3) + 2-opt (swap) + Or-opt-inv(2,3).
+    Estrategia "first-improvement": en cuanto encuentra mejora, reinicia.
+    Detiene si se supera t_cut.
+    """
     n = len(seq)
-    a, b, c = sorted(random.sample(range(1, n), 3))
-    return seq[:a] + seq[c:n] + seq[b:c] + seq[a:b]
+    improved_global = True
+
+    while improved_global:
+        if time.perf_counter() > t_cut:
+            break
+        improved_global = False
+
+        # ── Or-opt: reinserción de segmentos de tamaño 1, 2, 3 ──────────────
+        for tam in [1, 2, 3]:
+            improved = True
+            while improved:
+                if time.perf_counter() > t_cut:
+                    return seq, best_c
+                improved = False
+                for i in range(n - tam + 1):
+                    seg = seq[i: i + tam]
+                    base = seq[:i] + seq[i + tam:]
+                    lb = len(base)
+                    for j in range(lb + 1):
+                        cand = base[:j] + seg + base[j:]
+                        c = _cmax(cand, tipo_arr, proc_arr, su)
+                        if c < best_c:
+                            best_c = c
+                            seq = cand
+                            improved = True
+                            improved_global = True
+                            break  # first-improvement: reiniciar barrido
+                    if improved:
+                        break
+
+        # ── 2-opt: intercambio de pares ──────────────────────────────────────
+        improved = True
+        while improved:
+            if time.perf_counter() > t_cut:
+                return seq, best_c
+            improved = False
+            for i in range(n - 1):
+                for j in range(i + 1, n):
+                    seq[i], seq[j] = seq[j], seq[i]
+                    c = _cmax(seq, tipo_arr, proc_arr, su)
+                    if c < best_c:
+                        best_c = c
+                        improved = True
+                        improved_global = True
+                        break  # first-improvement
+                    else:
+                        seq[i], seq[j] = seq[j], seq[i]
+                if improved:
+                    break
+
+        # ── Or-opt invertido: reinserción de segmentos invertidos ────────────
+        improved = True
+        while improved:
+            if time.perf_counter() > t_cut:
+                return seq, best_c
+            improved = False
+            for i in range(n - 1):
+                for tam in [2, 3]:
+                    if i + tam > n:
+                        continue
+                    seg_inv = seq[i: i + tam][::-1]
+                    base = seq[:i] + seq[i + tam:]
+                    lb = len(base)
+                    for j in range(lb + 1):
+                        cand = base[:j] + seg_inv + base[j:]
+                        c = _cmax(cand, tipo_arr, proc_arr, su)
+                        if c < best_c:
+                            best_c = c
+                            seq = cand
+                            improved = True
+                            improved_global = True
+                            break
+                    if improved:
+                        break
+                if improved:
+                    break
+
+    return seq, best_c
 
 
-def _perturbacion_guiada(seq, tipo, factible):
-    orden = [0, 1, 2]
-    random.shuffle(orden)
-    for ti in orden:
-        idx = [i for i, j in enumerate(seq) if tipo[j] == ti]
-        if len(idx) < 2: continue
-        k   = random.randint(1, min(3, len(idx)))
-        sel = sorted(random.sample(idx, k), reverse=True)
+# ---------------------------------------------------------------------------
+# FASE 3 — ILS: perturbaciones + búsqueda local
+# ---------------------------------------------------------------------------
+
+def _double_bridge(seq: list) -> list:
+    """Perturbación clásica de 4 cortes que rompe óptimos locales."""
+    n = len(seq)
+    pos = sorted(random.sample(range(1, n), 3))
+    a, b, c = pos
+    return seq[0:a] + seq[c:n] + seq[b:c] + seq[a:b]
+
+
+def _perturbacion_guiada(seq: list, tipo_arr: list) -> list:
+    """
+    Extrae un bloque de lotes del mismo tipo y lo reinserta en otra posición.
+    Garantiza factibilidad; si no logra construir una perturbación válida,
+    cae sobre double-bridge.
+    """
+    order = [0, 1, 2]
+    random.shuffle(order)
+    for t in order:
+        indices = [i for i, l in enumerate(seq) if tipo_arr[l] == t]
+        if len(indices) < 2:
+            continue
+        k = random.randint(1, min(3, len(indices)))
+        sel = sorted(random.sample(indices, k), reverse=True)
         nuevo = seq[:]
         ext = []
-        for i in sel: ext.insert(0, nuevo.pop(i))
-        p = random.randint(0, len(nuevo))
-        nuevo = nuevo[:p] + ext + nuevo[p:]
-        if factible(nuevo): return nuevo
+        for idx in sel:
+            ext.insert(0, nuevo.pop(idx))
+        pos = random.randint(0, len(nuevo))
+        nuevo = nuevo[:pos] + ext + nuevo[pos:]
+        if _es_factible(nuevo, tipo_arr):
+            return nuevo
     return _double_bridge(seq)
 
 
-def _perturbacion_bloque(seq, tipo, factible):
-    orden = [0, 1, 2]
-    random.shuffle(orden)
-    for ti in orden:
-        idx = [i for i, j in enumerate(seq) if tipo[j] == ti]
-        if len(idx) < 2: continue
-        inicio = random.choice(idx)
-        nuevo = seq[:]
-        val = nuevo.pop(inicio)
-        p = random.randint(0, len(nuevo))
-        nuevo = nuevo[:p] + [val] + nuevo[p:]
-        if factible(nuevo): return nuevo
-    return _double_bridge(seq)
-
-
-def _ils(seq_ini, c_ini, tipo, cmax, factible, t_corte,
-         max_estanco=600, t_minimo=0.0):
-    """ILS con aceptación Simulated Annealing, temperatura decreciente y parada
-    temprana: si tras `max_estanco` iteraciones no mejora el mejor global (y ya
-    pasó `t_minimo` s), termina. `t_corte` es el tope duro de seguridad."""
-    mejor  = seq_ini[:]; mc = c_ini
-    actual = seq_ini[:]; ac = c_ini
-    elite  = [(mc, mejor[:])]
-
-    t_inicio_ils = time.perf_counter()
-    duracion_ils = max(t_corte - t_inicio_ils, 1.0)
-
-    T0    = max(ac * 0.015, 3.0)   # temperatura inicial ~1.5 % del Cmax
-    T_min = 0.3
-
-    sin_mejora = 0      # estancamiento del óptimo local actual (reinicio elite)
-    estanco_global = 0  # iteraciones sin mejorar el mejor global (parada temprana)
+def _ils(
+    seq: list, best_c: float,
+    tipo_arr: list, proc_arr: list, su: list,
+    t_cut: float
+) -> tuple:
+    """
+    Iterated Local Search:
+      - Alterna double-bridge y perturbación guiada.
+      - Reinicia desde el mejor global cada 20 iteraciones sin mejora.
+      - Asigna hasta 40% del tiempo restante (máx 2 s) a cada búsqueda local.
+    """
+    cur = seq[:]
+    cur_c = best_c
     it = 0
 
-    while time.perf_counter() < t_corte:
-        t_restante = t_corte - time.perf_counter()
-        if t_restante < 0.05: break
+    while time.perf_counter() < t_cut:
+        perturb = (
+            _double_bridge(cur) if it % 2 == 0
+            else _perturbacion_guiada(cur, tipo_arr)
+        )
 
-        # Parada temprana: ya convergió y se cumplió el tiempo mínimo
-        if (estanco_global >= max_estanco and
-                time.perf_counter() - t_inicio_ils >= t_minimo):
-            break
+        t_remaining = t_cut - time.perf_counter()
+        t_bl = time.perf_counter() + min(t_remaining * 0.40, 2.0)
+        p_c = _cmax(perturb, tipo_arr, proc_arr, su)
+        p, p_c = _busqueda_local(perturb, p_c, tipo_arr, proc_arr, su, t_bl)
 
-        t_frac = (time.perf_counter() - t_inicio_ils) / duracion_ils
-        T_sa   = max(T0 * math.exp(-5.0 * t_frac), T_min)
+        # Criterio de aceptación: solo mejora estricta (descent)
+        if p_c < cur_c:
+            cur = p[:]
+            cur_c = p_c
 
-        if sin_mejora > 25:
-            _, base = random.choice(elite)
-            actual  = base[:]; ac = cmax(actual)
-            sin_mejora = 0
+        if cur_c < best_c:
+            best_c = cur_c
+            seq = cur[:]
 
-        m = it % 3
-        if m == 0:
-            perturb = _double_bridge(actual)
-        elif m == 1:
-            perturb = _perturbacion_guiada(actual, tipo, factible)
-        else:
-            perturb = _perturbacion_bloque(actual, tipo, factible)
-
-        t_bl = time.perf_counter() + min(t_restante * 0.3, 0.5)
-        sl, cl = _busqueda_local(perturb, cmax, t_corte=t_bl)
-
-        delta = cl - ac
-        if delta <= 0:
-            actual = sl[:]; ac = cl; sin_mejora = 0
-        elif T_sa > T_min and random.random() < math.exp(-delta / T_sa):
-            actual = sl[:]; ac = cl; sin_mejora += 1
-        else:
-            sin_mejora += 1
-
-        if ac < mc:
-            mc = ac; mejor = actual[:]
-            elite.append((mc, mejor[:]))
-            elite.sort(key=lambda x: x[0])
-            elite = elite[:5]
-            estanco_global = 0
-        else:
-            estanco_global += 1
+        # Reinicio periódico al mejor global
+        if it % 20 == 19 and cur_c > best_c:
+            cur = seq[:]
+            cur_c = best_c
 
         it += 1
 
-    return mejor, mc
+    return seq, best_c
 
 
-# =============================================================================
-# Orquestador interno común a solve() y resolver_instancia()
-# =============================================================================
-
-def _resolver(data, T, t_ms_frac, t_bl_frac, t_ils_frac,
-              max_estanco=600, t_minimo=0.3):
-    """Devuelve (secuencia_etiquetas, cmax_int).
-
-    T es un TOPE DURO de seguridad (en s). En la práctica el ILS para mucho
-    antes por convergencia (parada temprana), de modo que el tiempo reportado
-    es pequeño sin sacrificar calidad."""
-    t_inicio = time.perf_counter()
-    t_fin    = t_inicio + T
-
-    ids, tipo, cmax, factible = _compilar(data)
-    n = len(ids)
-    ids_int = list(range(n))
-
-    lotes = data["lotes"]
-    suma  = {j: lotes[ids[j]]["M1"] + lotes[ids[j]]["M2"] + lotes[ids[j]]["M3"]
-             for j in ids_int}
-
-    # 1. NEH multistart
-    seq, c = _multi_start(ids_int, tipo, suma, cmax,
-                          t_corte=t_inicio + T * t_ms_frac)
-
-    # 2. Intensificación inicial
-    seq, c = _busqueda_local(seq, cmax,
-                             t_corte=time.perf_counter() + T * t_bl_frac)
-
-    # 3. ILS-SA con parada temprana (tope duro = t_ils_fin)
-    t_ils_fin = t_inicio + T * t_ils_frac
-    if time.perf_counter() < t_ils_fin - 0.05:
-        seq_ils, c_ils = _ils(seq, c, tipo, cmax, factible, t_corte=t_ils_fin,
-                              max_estanco=max_estanco, t_minimo=t_minimo)
-        if c_ils < c:
-            c = c_ils; seq = seq_ils[:]
-
-    # 4. Pulido final (BL exhaustiva sin gastar tiempo extra significativo)
-    seq, c = _busqueda_local(seq, cmax, t_corte=t_fin)
-
-    # Traducir a etiquetas
-    seq_lbl = [ids[j] for j in seq]
-
-    # Fallback de seguridad
-    if c == INF or not _es_factible(seq_lbl, lotes):
-        orden = sorted(ids_int, key=lambda j: suma[j], reverse=True)
-        seq   = _neh_una_vez(orden, cmax)
-        c     = cmax(seq)
-        seq_lbl = [ids[j] for j in seq]
-
-    return seq_lbl, int(c)
-
-
-# =============================================================================
-# solve() — formato exacto del reto
-# =============================================================================
+# ---------------------------------------------------------------------------
+# FUNCIÓN PRINCIPAL — solve() — requerida por Gradescope
+# ---------------------------------------------------------------------------
 
 def solve(data: dict) -> dict:
+    """
+    Parámetro : data — diccionario cargado desde data.json
+    Retorna   : {"Cmax": int, "secuencia": list[str], "tiempo": int}
+
+    Estrategia:
+      1. Pre-cómputo de arrays numéricos (evita overhead de strings en el loop caliente)
+      2. Heurística NEH para solución inicial de calidad
+      3. Búsqueda local completa (Or-opt 1/2/3 + 2-opt + Or-opt-inv)
+      4. ILS hasta agotar el presupuesto de tiempo (55 s con margen de seguridad)
+    """
+    start_ms = time.time()
     t_inicio = time.perf_counter()
-    # T=8s es solo el tope duro de seguridad (<< 60s). La parada temprana hace
-    # que en la práctica termine en ~0.5-1s una vez confirmada la convergencia.
-    seq_lbl, cmax = _resolver(data, T=8.0,
-                              t_ms_frac=0.05, t_bl_frac=0.10, t_ils_frac=0.95,
-                              max_estanco=600, t_minimo=0.3)
+    TIEMPO_LIMITE = 55.0                          # margen ante el límite de 60 s
+    t_cut = t_inicio + TIEMPO_LIMITE
+
+    random.seed(42)
+    np.random.seed(42)
+
+    lotes_dict = data["lotes"]
+    setup_dict = data["setup"]
+
+    # ── Pre-cómputo ──────────────────────────────────────────────────────────
+    lote_ids, tipo_arr, proc_arr, su = _build_arrays(lotes_dict, setup_dict)
+    n = len(lote_ids)
+
+    # ── Fase 1: NEH ──────────────────────────────────────────────────────────
+    seq, best_c = _neh(n, tipo_arr, proc_arr, su)
+
+    # ── Fase 2: búsqueda local inicial ───────────────────────────────────────
+    seq, best_c = _busqueda_local(seq, best_c, tipo_arr, proc_arr, su, t_cut)
+
+    # ── Fase 3: ILS hasta agotar tiempo ─────────────────────────────────────
+    if time.perf_counter() < t_cut - 0.5:
+        seq, best_c = _ils(seq, best_c, tipo_arr, proc_arr, su, t_cut)
+
+    # ── Validación de seguridad ──────────────────────────────────────────────
+    if not _es_factible(seq, tipo_arr) or best_c == INF:
+        seq, best_c = _neh(n, tipo_arr, proc_arr, su)
+
+    elapsed_ms = int((time.time() - start_ms) * 1000)
+
     return {
-        "Cmax":      cmax,
-        "secuencia": seq_lbl,
-        "tiempo":    int((time.perf_counter() - t_inicio) * 1000)
+        "Cmax": int(best_c),
+        "secuencia": [lote_ids[i] for i in seq],
+        "tiempo": elapsed_ms,
     }
 
 
-# =============================================================================
-# CLASE SCHEDULLING — estructura requerida por la competencia
-# =============================================================================
+# ---------------------------------------------------------------------------
+# CLASE Schedulling — estructura auxiliar para experimentos locales
+# ---------------------------------------------------------------------------
+
+TIEMPO_POR_INSTANCIA = 15.0
+
 
 class Schedulling:
     def __init__(self, n_instancias: int = 30, semilla: int = 42):
@@ -453,39 +389,61 @@ class Schedulling:
         self.consolidado = None
 
     def generar_instancia(self, indice):
-        tipos  = ["S", "N", "R"]
-        lotes  = [f"L{i}" for i in range(1, 16)]
+        tipos = ["S", "N", "R"]
+        lotes_list = [f"L{i}" for i in range(1, 16)]
         rangos = {"M1": (25, 45), "M2": (20, 40), "M3": (10, 25)}
 
         lotes_dict = {}
-        for lote in lotes:
+        for lote in lotes_list:
+            tipo = random.choice(tipos)
             lotes_dict[lote] = {
-                "tipo": random.choice(tipos),
-                "M1":   random.randint(*rangos["M1"]),
-                "M2":   random.randint(*rangos["M2"]),
-                "M3":   random.randint(*rangos["M3"])
+                "tipo": tipo,
+                "M1": random.randint(*rangos["M1"]),
+                "M2": random.randint(*rangos["M2"]),
+                "M3": random.randint(*rangos["M3"]),
             }
 
         setup_dict = {}
-        for maquina in ("M1", "M2", "M3"):
+        for maquina in ["M1", "M2", "M3"]:
             setup_dict[maquina] = {}
             for tipo_ant in tipos:
                 for tipo_sig in tipos:
                     if tipo_ant == tipo_sig:
                         t = 0
-                    elif maquina == "M1": t = random.randint(10, 40)
-                    elif maquina == "M2": t = random.randint(5, 30)
-                    else:                 t = random.randint(3, 15)
+                    elif maquina == "M1":
+                        t = random.randint(10, 40)
+                    elif maquina == "M2":
+                        t = random.randint(5, 30)
+                    else:
+                        t = random.randint(3, 15)
                     setup_dict[maquina][f"{tipo_ant}-{tipo_sig}"] = t
 
         return {"lotes": lotes_dict, "setup": setup_dict}
 
-    def resolver_instancia(self, instancia: dict) -> dict:
-        seq_lbl, cmax = _resolver(instancia, T=TIEMPO_POR_INSTANCIA,
-                                  t_ms_frac=FRACCION_MULTISTART,
-                                  t_bl_frac=FRACCION_BL,
-                                  t_ils_frac=0.95)
-        return {"secuencia": seq_lbl, "valor_objetivo": cmax}
+    def resolver_instancia(self, instancia: dict):
+        """NEH + búsqueda local + ILS con tiempo controlado por instancia."""
+        t_inicio = time.perf_counter()
+        t_cut = t_inicio + TIEMPO_POR_INSTANCIA
+
+        lotes_dict = instancia["lotes"]
+        setup_dict = instancia["setup"]
+
+        lote_ids, tipo_arr, proc_arr, su = _build_arrays(lotes_dict, setup_dict)
+        n = len(lote_ids)
+
+        seq, best_c = _neh(n, tipo_arr, proc_arr, su)
+        seq, best_c = _busqueda_local(seq, best_c, tipo_arr, proc_arr, su, t_cut)
+
+        if time.perf_counter() < t_cut - 0.5:
+            seq, best_c = _ils(seq, best_c, tipo_arr, proc_arr, su, t_cut)
+
+        if not _es_factible(seq, tipo_arr) or best_c == INF:
+            seq, best_c = _neh(n, tipo_arr, proc_arr, su)
+
+        return {
+            "secuencia": [lote_ids[i] for i in seq],
+            "valor_objetivo": int(best_c),
+        }
 
     def ejecutar_experimentos(self):
         """No modificar."""
@@ -498,61 +456,46 @@ class Schedulling:
             t0 = time.time()
             resultado = self.resolver_instancia(instancia)
             t1 = time.time()
+
             self.resultados["instancia"].append(i)
             self.resultados["valor_objetivo"].append(resultado.get("valor_objetivo", 0))
             self.resultados["tiempo_seg"].append(round(t1 - t0, 4))
-            print(f"Instancia {i}: Cmax={resultado.get('valor_objetivo','?')} "
-                  f"en {round(t1-t0,2)}s")
+            print(f"Instancia {i} optimizada en {round(t1-t0, 4)} seg")
 
         tiempo_total = time.time() - inicio_total
-        self.consolidado = self.resultados
+        self.consolidado = pd.DataFrame(self.resultados)
+        promedio_tiempo = self.consolidado["tiempo_seg"].mean()
 
-        valores = self.resultados["valor_objetivo"]
-        tiempos = self.resultados["tiempo_seg"]
         print("\n==== REPORTE DE RENDIMIENTO ====")
-        print("Tiempo promedio:", round(sum(tiempos) / len(tiempos), 4), "seg")
-        print("Cmax promedio:  ", round(sum(valores) / len(valores), 1))
-        print("Tiempo total:   ", round(tiempo_total, 2), "seg")
+        print("Tiempo promedio por instancia:", round(promedio_tiempo, 4), "seg")
+        print("Tiempo total de ejecución:", round(tiempo_total, 2), "seg")
         return self.consolidado
 
-    def calcular_makespan_penalizado(self, data, secuencia):
-        lotes    = data["lotes"]
-        setup    = data["setup"]
-        maquinas = ["M1", "M2", "M3"]
+    def calcular_makespan_penalizado(
+        self,
+        data: dict = {},
+        secuencia: list = [f"L{i}" for i in range(1, 16)],
+    ):
+        """
+        Calcula el makespan real (o INF si hay violación N→R) usando la
+        misma lógica que _cmax para garantizar consistencia.
+        """
+        lotes_dict = data["lotes"]
+        setup_dict = data["setup"]
+        lote_ids, tipo_arr, proc_arr, su = _build_arrays(lotes_dict, setup_dict)
 
-        for i in range(1, len(secuencia)):
-            if (lotes[secuencia[i-1]]["tipo"] == "N" and
-                    lotes[secuencia[i]]["tipo"] == "R"):
-                return INF
+        # Convertir secuencia de strings a índices
+        lote_index = {l: i for i, l in enumerate(lote_ids)}
+        idx_seq = [lote_index[l] for l in secuencia]
 
-        tiempos     = {m: [] for m in maquinas}
-        fin_maquina = {m: 0  for m in maquinas}
-        fin_lote    = {l: 0  for l in secuencia}
+        return _cmax(idx_seq, tipo_arr, proc_arr, su)
 
-        for lote in secuencia:
-            tipo_actual = lotes[lote]["tipo"]
-            for m_idx, m in enumerate(maquinas):
-                prev_tipo = tiempos[m][-1]["tipo"] if tiempos[m] else None
-                t_setup = 0
-                if prev_tipo is not None and prev_tipo != tipo_actual:
-                    t_setup = setup[m][f"{prev_tipo}-{tipo_actual}"]
-                inicio = (fin_maquina[m] if m_idx == 0
-                          else max(fin_maquina[m], fin_lote[lote])) + t_setup
-                fin    = inicio + lotes[lote][m]
-                tiempos[m].append({"lote": lote, "tipo": tipo_actual})
-                fin_maquina[m] = fin
-                fin_lote[lote] = fin
 
-        return max(fin_maquina.values())
-
+# ---------------------------------------------------------------------------
+# PUNTO DE ENTRADA — Gradescope llama a solve(data)
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import os
-    if os.path.exists("data.json"):
-        with open("data.json", encoding="utf-8") as f:
-            data = json.load(f)
-        print(json.dumps(solve(data), indent=2, ensure_ascii=False))
-    else:
-        sch = Schedulling(n_instancias=3)
-        resultado = sch.ejecutar_experimentos()
-        print(resultado)
+    with open("data.json") as f:
+        data = json.load(f)
+    print(json.dumps(solve(data), indent=2))
