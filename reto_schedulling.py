@@ -18,7 +18,7 @@ import json
 # ─────────────────────────────────────────────────────────────────────────────
 # PARÁMETROS
 # ─────────────────────────────────────────────────────────────────────────────
-TIEMPO_POR_INSTANCIA = 5.0    # 30 × 5s = 150s total — mucho menor que 600s límite
+TIEMPO_POR_INSTANCIA = 55.0   # aprovecha casi todo el tiempo permitido (límite: 60s)
 FRACCION_MULTISTART  = 0.05   # 5%  → ~0.25s (NEH converge instantáneo, no necesita más)
 FRACCION_BL          = 0.10   # 10% → ~0.5s para búsqueda local inicial
                                # 85% → ~4.25s para ILS
