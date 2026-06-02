@@ -3,13 +3,8 @@ Reto 01 — Willy Wonka | Flow Shop 3 máquinas con setups y restricción N→R
 Algoritmo: NEH multistart + Búsqueda Local (Or-opt 1-3, swap, Or-opt-inv, 3-opt)
            + ILS con Simulated Annealing y elite pool.
 
-Motor de evaluación "compilado": los datos se traducen a enteros (tipos 0/1/2,
-tiempos y setups en arrays indexados) y toda la búsqueda opera sobre secuencias
-de enteros. Esto da ~8x más evaluaciones de Cmax por segundo que la versión con
-diccionarios + f-strings, lo que se traduce en muchas más iteraciones de ILS y
-por tanto en un Cmax menor a igualdad de tiempo.
-
-Librerías: solo stdlib + numpy (cumple la restricción del instructivo).
+OPTIMIZADO: Tiempo por instancia reducido a 0.8s → 30 instancias ≈ 24s total.
+Librerías: solo stdlib + numpy.
 """
 
 import random
@@ -21,12 +16,12 @@ import json
 INF = float("inf")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PARÁMETROS  (resolver_instancia / tests locales)
+# PARÁMETROS
 # ─────────────────────────────────────────────────────────────────────────────
-TIEMPO_POR_INSTANCIA = 5.0    # 30 × 5 s = 150 s total << 600 s límite local
-FRACCION_MULTISTART  = 0.05   # 5 %  → NEH multistart
-FRACCION_BL          = 0.10   # 10 % → intensificación inicial
-                               # 85 % → ILS-SA + pulido
+TIEMPO_POR_INSTANCIA = 0.8    # 30 × 0.8 s ≈ 24 s total << 60 s límite
+FRACCION_MULTISTART  = 0.10   # 10% → NEH multistart
+FRACCION_BL          = 0.15   # 15% → intensificación inicial
+                               # 75% → ILS-SA + pulido
 
 
 # =============================================================================
@@ -34,8 +29,8 @@ FRACCION_BL          = 0.10   # 10 % → intensificación inicial
 # =============================================================================
 
 def _compilar(data):
-    """Devuelve (ids, tipo, cmax, factible) con cmax/factible operando sobre
-    secuencias de enteros (índices 0..n-1). Tipos: S=0, N=1, R=2."""
+    """Devuelve (ids, tipo, cmax, factible) operando sobre índices enteros.
+    Tipos: S=0, N=1, R=2."""
     TI    = {"S": 0, "N": 1, "R": 2}
     tipos = ("S", "N", "R")
     lotes = data["lotes"]
@@ -51,28 +46,37 @@ def _compilar(data):
     S2 = [[setup["M2"][f"{a}-{b}"] for b in tipos] for a in tipos]
     S3 = [[setup["M3"][f"{a}-{b}"] for b in tipos] for a in tipos]
 
+    # Pre-computar arrays para acceso rápido
+    tipo_arr = tipo
+    p1_arr   = p1
+    p2_arr   = p2
+    p3_arr   = p3
+
     def cmax(seq):
         j0 = seq[0]
-        f0 = p1[j0]; f1 = f0 + p2[j0]; f2 = f1 + p3[j0]
-        pa = tipo[j0]
+        f0 = p1_arr[j0]
+        f1 = f0 + p2_arr[j0]
+        f2 = f1 + p3_arr[j0]
+        pa = tipo_arr[j0]
         for idx in range(1, len(seq)):
-            j  = seq[idx]; ta = tipo[j]
+            j  = seq[idx]; ta = tipo_arr[j]
             if pa == 1 and ta == 2:        # N → R infactible
                 return INF
             if pa != ta:
-                f0 = f0 + S1[pa][ta] + p1[j]
-                f1 = (f1 if f1 > f0 else f0) + S2[pa][ta] + p2[j]
-                f2 = (f2 if f2 > f1 else f1) + S3[pa][ta] + p3[j]
+                f0 = f0 + S1[pa][ta] + p1_arr[j]
+                f1 = (f1 if f1 > f0 else f0) + S2[pa][ta] + p2_arr[j]
+                f2 = (f2 if f2 > f1 else f1) + S3[pa][ta] + p3_arr[j]
             else:
-                f0 = f0 + p1[j]
-                f1 = (f1 if f1 > f0 else f0) + p2[j]
-                f2 = (f2 if f2 > f1 else f1) + p3[j]
+                f0 = f0 + p1_arr[j]
+                f1 = (f1 if f1 > f0 else f0) + p2_arr[j]
+                f2 = (f2 if f2 > f1 else f1) + p3_arr[j]
             pa = ta
         return f2
 
     def factible(seq):
+        ta = tipo_arr
         for idx in range(1, len(seq)):
-            if tipo[seq[idx-1]] == 1 and tipo[seq[idx]] == 2:
+            if ta[seq[idx-1]] == 1 and ta[seq[idx]] == 2:
                 return False
         return True
 
@@ -84,7 +88,6 @@ def _compilar(data):
 # =============================================================================
 
 def _calcular_cmax(secuencia, lotes, setup):
-    """Flow-shop Cmax con setups. Retorna inf si aparece N→R. (sobre etiquetas)"""
     for i in range(1, len(secuencia)):
         if (lotes[secuencia[i-1]]["tipo"] == "N" and
                 lotes[secuencia[i]]["tipo"] == "R"):
@@ -114,7 +117,7 @@ def _es_factible(secuencia, lotes):
 
 
 # =============================================================================
-# FASE 1 — NEH multistart  (opera sobre enteros)
+# FASE 1 — NEH multistart (opera sobre enteros)
 # =============================================================================
 
 def _neh_una_vez(orden, cmax):
@@ -133,10 +136,9 @@ def _multi_start(ids_int, tipo, suma, cmax, t_corte):
     best_c = INF
     best_seq = None
 
-    # 6 agrupaciones deterministas por tipo (S=0,N=1,R=2)
     nombre = {"S": 0, "N": 1, "R": 2}
-    for orden_tipos in (("S","N","R"), ("S","R","N"), ("R","S","N"),
-                        ("N","S","R"), ("R","N","S"), ("N","R","S")):
+    # Solo las 3 ordenaciones más prometedoras (antes eran 6)
+    for orden_tipos in (("S","N","R"), ("S","R","N"), ("R","S","N")):
         s = []
         for t in orden_tipos:
             ti = nombre[t]
@@ -159,7 +161,7 @@ def _multi_start(ids_int, tipo, suma, cmax, t_corte):
     seed = 1
     while time.perf_counter() < t_corte:
         rng = random.Random(seed)
-        noise = min(seed * 2, 60)
+        noise = min(seed * 2, 40)
         orden = sorted(ids_int, key=lambda j: suma[j] + rng.uniform(-noise, noise),
                        reverse=True)
         seq = _neh_una_vez(orden, cmax)
@@ -172,7 +174,7 @@ def _multi_start(ids_int, tipo, suma, cmax, t_corte):
 
 
 # =============================================================================
-# FASE 2 — Búsqueda local (Or-opt 1-3, swap, Or-opt-inv, 3-opt)  sobre enteros
+# FASE 2 — Búsqueda local acelerada (Or-opt 1-2, swap, 3-opt)
 # =============================================================================
 
 def _busqueda_local(seq, cmax, t_corte=None):
@@ -186,8 +188,8 @@ def _busqueda_local(seq, cmax, t_corte=None):
             break
         mg = False
 
-        # Or-opt (segmentos de 1, 2, 3)
-        for tam in (1, 2, 3):
+        # Or-opt segmentos de 1 y 2 (más rápido que incluir 3)
+        for tam in (1, 2):
             mejorado = True
             while mejorado:
                 if t_corte and time.perf_counter() > t_corte:
@@ -219,24 +221,6 @@ def _busqueda_local(seq, cmax, t_corte=None):
                         mc = c; mejor = cand[:]
                         mejorado = True; mg = True; break
 
-        # Or-opt invertido (segmentos de 2 y 3 revertidos y reinsertados)
-        mejorado = True
-        while mejorado:
-            if t_corte and time.perf_counter() > t_corte:
-                return mejor, mc
-            mejorado = False
-            for i in range(n - 1):
-                if mejorado: break
-                for tam in (2, 3):
-                    if i + tam > n: continue
-                    seg_inv = mejor[i:i+tam][::-1]
-                    base = mejor[:i] + mejor[i+tam:]
-                    for j in range(len(base) + 1):
-                        c = cmax(base[:j] + seg_inv + base[j:])
-                        if c < mc:
-                            mc = c; mejor = base[:j] + seg_inv + base[j:]
-                            mejorado = True; mg = True; break
-
         # 3-opt (inversión de segmento contiguo)
         mejorado = True
         while mejorado:
@@ -256,7 +240,7 @@ def _busqueda_local(seq, cmax, t_corte=None):
 
 
 # =============================================================================
-# FASE 3 — ILS con Simulated Annealing y elite pool  (sobre enteros)
+# FASE 3 — ILS con Simulated Annealing y elite pool
 # =============================================================================
 
 def _double_bridge(seq):
@@ -298,29 +282,27 @@ def _perturbacion_bloque(seq, tipo, factible):
 
 
 def _ils(seq_ini, c_ini, tipo, cmax, factible, t_corte,
-         max_estanco=600, t_minimo=0.0):
-    """ILS con aceptación Simulated Annealing, temperatura decreciente y parada
-    temprana: si tras `max_estanco` iteraciones no mejora el mejor global (y ya
-    pasó `t_minimo` s), termina. `t_corte` es el tope duro de seguridad."""
+         max_estanco=200, t_minimo=0.0):
+    """ILS con SA, parada temprana agresiva para terminar rápido."""
     mejor  = seq_ini[:]; mc = c_ini
     actual = seq_ini[:]; ac = c_ini
     elite  = [(mc, mejor[:])]
 
     t_inicio_ils = time.perf_counter()
-    duracion_ils = max(t_corte - t_inicio_ils, 1.0)
+    duracion_ils = max(t_corte - t_inicio_ils, 0.5)
 
-    T0    = max(ac * 0.015, 3.0)   # temperatura inicial ~1.5 % del Cmax
+    T0    = max(ac * 0.015, 3.0)
     T_min = 0.3
 
-    sin_mejora = 0      # estancamiento del óptimo local actual (reinicio elite)
-    estanco_global = 0  # iteraciones sin mejorar el mejor global (parada temprana)
+    sin_mejora     = 0
+    estanco_global = 0
     it = 0
 
     while time.perf_counter() < t_corte:
         t_restante = t_corte - time.perf_counter()
-        if t_restante < 0.05: break
+        if t_restante < 0.03: break
 
-        # Parada temprana: ya convergió y se cumplió el tiempo mínimo
+        # Parada temprana cuando converge
         if (estanco_global >= max_estanco and
                 time.perf_counter() - t_inicio_ils >= t_minimo):
             break
@@ -328,7 +310,7 @@ def _ils(seq_ini, c_ini, tipo, cmax, factible, t_corte,
         t_frac = (time.perf_counter() - t_inicio_ils) / duracion_ils
         T_sa   = max(T0 * math.exp(-5.0 * t_frac), T_min)
 
-        if sin_mejora > 25:
+        if sin_mejora > 20:
             _, base = random.choice(elite)
             actual  = base[:]; ac = cmax(actual)
             sin_mejora = 0
@@ -341,7 +323,8 @@ def _ils(seq_ini, c_ini, tipo, cmax, factible, t_corte,
         else:
             perturb = _perturbacion_bloque(actual, tipo, factible)
 
-        t_bl = time.perf_counter() + min(t_restante * 0.3, 0.5)
+        # BL más corta por iteración: 20% del tiempo restante, máx 0.15s
+        t_bl = time.perf_counter() + min(t_restante * 0.20, 0.15)
         sl, cl = _busqueda_local(perturb, cmax, t_corte=t_bl)
 
         delta = cl - ac
@@ -367,16 +350,11 @@ def _ils(seq_ini, c_ini, tipo, cmax, factible, t_corte,
 
 
 # =============================================================================
-# Orquestador interno común a solve() y resolver_instancia()
+# Orquestador interno
 # =============================================================================
 
 def _resolver(data, T, t_ms_frac, t_bl_frac, t_ils_frac,
-              max_estanco=600, t_minimo=0.3):
-    """Devuelve (secuencia_etiquetas, cmax_int).
-
-    T es un TOPE DURO de seguridad (en s). En la práctica el ILS para mucho
-    antes por convergencia (parada temprana), de modo que el tiempo reportado
-    es pequeño sin sacrificar calidad."""
+              max_estanco=200, t_minimo=0.1):
     t_inicio = time.perf_counter()
     t_fin    = t_inicio + T
 
@@ -396,18 +374,17 @@ def _resolver(data, T, t_ms_frac, t_bl_frac, t_ils_frac,
     seq, c = _busqueda_local(seq, cmax,
                              t_corte=time.perf_counter() + T * t_bl_frac)
 
-    # 3. ILS-SA con parada temprana (tope duro = t_ils_fin)
+    # 3. ILS-SA
     t_ils_fin = t_inicio + T * t_ils_frac
-    if time.perf_counter() < t_ils_fin - 0.05:
+    if time.perf_counter() < t_ils_fin - 0.02:
         seq_ils, c_ils = _ils(seq, c, tipo, cmax, factible, t_corte=t_ils_fin,
                               max_estanco=max_estanco, t_minimo=t_minimo)
         if c_ils < c:
             c = c_ils; seq = seq_ils[:]
 
-    # 4. Pulido final (BL exhaustiva sin gastar tiempo extra significativo)
+    # 4. Pulido final
     seq, c = _busqueda_local(seq, cmax, t_corte=t_fin)
 
-    # Traducir a etiquetas
     seq_lbl = [ids[j] for j in seq]
 
     # Fallback de seguridad
@@ -426,13 +403,11 @@ def _resolver(data, T, t_ms_frac, t_bl_frac, t_ils_frac,
 
 def solve(data: dict) -> dict:
     t_inicio = time.perf_counter()
-    # T=8s es solo el tope duro de seguridad (<< 60s). La parada temprana hace
-    # que en la práctica termine en ~0.5-1s una vez confirmada la convergencia.
-    seq_lbl, cmax = _resolver(data, T=8.0,
-                              t_ms_frac=0.05, t_bl_frac=0.10, t_ils_frac=0.95,
-                              max_estanco=600, t_minimo=0.3)
+    seq_lbl, cmax_val = _resolver(data, T=1.5,
+                                  t_ms_frac=0.10, t_bl_frac=0.15, t_ils_frac=0.95,
+                                  max_estanco=200, t_minimo=0.1)
     return {
-        "Cmax":      cmax,
+        "Cmax":      cmax_val,
         "secuencia": seq_lbl,
         "tiempo":    int((time.perf_counter() - t_inicio) * 1000)
     }
@@ -481,11 +456,13 @@ class Schedulling:
         return {"lotes": lotes_dict, "setup": setup_dict}
 
     def resolver_instancia(self, instancia: dict) -> dict:
-        seq_lbl, cmax = _resolver(instancia, T=TIEMPO_POR_INSTANCIA,
-                                  t_ms_frac=FRACCION_MULTISTART,
-                                  t_bl_frac=FRACCION_BL,
-                                  t_ils_frac=0.95)
-        return {"secuencia": seq_lbl, "valor_objetivo": cmax}
+        seq_lbl, cmax_val = _resolver(instancia, T=TIEMPO_POR_INSTANCIA,
+                                      t_ms_frac=FRACCION_MULTISTART,
+                                      t_bl_frac=FRACCION_BL,
+                                      t_ils_frac=0.92,
+                                      max_estanco=200,
+                                      t_minimo=0.05)
+        return {"secuencia": seq_lbl, "valor_objetivo": cmax_val}
 
     def ejecutar_experimentos(self):
         """No modificar."""
@@ -553,6 +530,6 @@ if __name__ == "__main__":
             data = json.load(f)
         print(json.dumps(solve(data), indent=2, ensure_ascii=False))
     else:
-        sch = Schedulling(n_instancias=3)
+        sch = Schedulling(n_instancias=30)
         resultado = sch.ejecutar_experimentos()
         print(resultado)
